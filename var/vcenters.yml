@@ -1,0 +1,17 @@
+---
+#vcenter_username: fr24862a@frost_bank
+vcenters:
+  dr:
+  - hostname: FDR-VCENTER01.fnb.cfbi.local
+    datacenter: Frost Disaster Recovery
+    folder: "/Frost Disaster Recovery/vm/Midrange Servers"
+
+  prod:
+  - hostname: FTC-VCENTER01.fnb.cfbi.local
+    datacenter: Frost Technology Center
+    folder: "/Frost Technology Center/vm/Midrange Servers"
+
+  nonprod:
+  - hostname: ftc-vcentert1.fnb.cfbi.local
+    datacenter: Frost Technology Center
+    folder: "/Frost Technology Center/vm/Midrange Servers"
