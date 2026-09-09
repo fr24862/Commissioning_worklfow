@@ -1,0 +1,366 @@
+---
+# 01_vm_build_skeleton.yml
+#
+# Purpose:
+#   Safe starting point for provisioning Linux VMs from VMware templates.
+#   The playbook runs against inventory records representing VMs that do not
+#   exist yet; VMware tasks are delegated to the Ansible controller.
+#
+# Default behavior:
+#   build_action=plan performs validation and prints the proposed build.
+#   No VM is created unless both of these are supplied:
+#     -e build_action=create -e confirm_create=CREATE-VM
+#
+# Example commands:
+#   ansible-playbook -i inventory/build_hosts.yml playbooks/01_vm_build_skeleton.yml
+#   ansible-playbook -i inventory/build_hosts.yml playbooks/01_vm_build_skeleton.yml \
+#     -e build_action=create -e confirm_create=CREATE-VM
+
+- name: Validate, plan, and optionally create Linux VMs
+  hosts: all
+  gather_facts: false
+  connection: local
+  serial: 1
+
+  collections:
+  - community.general
+  - community.vmware
+
+  vars_prompt:
+  - name: vcenter_username
+    prompt: vCenter username
+    private: false
+
+  - name: vcenter_password
+    prompt: vCenter password
+    private: true
+
+  vars:
+    # Safety controls. Extra vars can override these values.
+    build_action: plan
+    confirm_create: "NO"
+    validate_certs: false
+    power_on_after_build: false
+    wait_for_ssh_after_power_on: true
+    ssh_wait_timeout: 900
+
+    # VMware Python environment already used by the decommission workflow.
+    ansible_python_interpreter: /home/fr24862a/.venvs/ansible-vmware/bin/python
+
+    # Capacity policy placeholder. Enforce this after confirming the exact
+    # vmware_datastore_info return structure in the installed collection.
+    maximum_projected_datastore_used_percent: 80
+
+    # Standardized names derived from inventory data.
+    vm_name: "{{ inventory_hostname.split('.')[0] | upper }}"
+    vm_annotation: |
+      Status: VM commissioned through Ansible.
+      Change: {{ change_control_id }}
+      Environment: {{ build_environment }}
+      Template: {{ vm_template }}
+      Build date: {{ lookup('pipe', 'date +%m-%d-%Y') }}
+
+  pre_tasks:
+  - name: Validate workflow safety controls
+    ansible.builtin.assert:
+      that:
+      - build_action in ['plan', 'create']
+      - build_action != 'create' or confirm_create == 'CREATE-VM'
+      fail_msg: >-
+        build_action must be plan or create. Creation also requires confirm_create=CREATE-VM.
+    tags: [ always ]
+
+  - name: Validate required build variables
+    ansible.builtin.assert:
+      that:
+      - change_control_id is defined
+      - change_control_id | string | length > 0
+      - build_environment is defined
+      - build_environment in ['dev', 'test', 'prod', 'dr']
+      - vm_fqdn is defined
+      - vm_fqdn | length > 0
+      - vm_domain is defined
+      - vm_domain | length > 0
+      - vm_ip_address is defined
+      - vm_ip_address | ansible.utils.ipaddr
+      - vm_netmask is defined
+      - vm_gateway is defined
+      - vm_dns_servers is defined
+      - vm_dns_servers | type_debug == 'list'
+      - vm_dns_servers | length > 0
+      - vm_vcenter is defined
+      - vm_datacenter is defined
+      - vm_cluster is defined
+      - vm_folder is defined
+      - vm_template is defined
+      - vm_datastore is defined
+      - vm_network is defined
+      - vm_cpus is defined
+      - vm_cpus | int > 0
+      - vm_memory_mb is defined
+      - vm_memory_mb | int >= 1024
+      fail_msg: >-
+        One or more required build variables are missing or invalid. Review the host definition in inventory/build_hosts.yml.
+    tags: [ always, validate ]
+
+  - name: Validate optional additional disk definitions
+    ansible.builtin.assert:
+      that:
+      - item.size_gb is defined
+      - item.size_gb | int > 0
+      - item.controller_type | default('paravirtual') in ['paravirtual', 'lsilogic', 'lsilogicsas']
+      - item.controller_number | default(0) | int >= 0
+      - item.unit_number is defined
+      - item.unit_number | int >= 1
+      fail_msg: "Invalid additional disk definition: {{ item }}"
+    loop: "{{ vm_additional_disks | default([]) }}"
+    loop_control:
+      label: "SCSI {{ item.controller_number | default(0) }}:{{ item.unit_number | default('?') }}"
+    tags: [ always, validate ]
+
+  tasks:
+  # ------------------------------------------------------------------
+  # Preflight checks
+  # ------------------------------------------------------------------
+  - name: Resolve the requested DNS A record
+    ansible.builtin.set_fact:
+      resolved_a_records: >-
+        {{ query('community.general.dig', vm_fqdn,
+                 qtype='A', fail_on_error=false, real_empty=true) }}
+    tags: [ checks, check_dns ]
+
+  - name: Resolve the requested DNS PTR record
+    ansible.builtin.set_fact:
+      resolved_ptr_records: >-
+        {{ query('community.general.dig', vm_ip_address,
+                 qtype='PTR', fail_on_error=false, real_empty=true)
+           | map('regex_replace', '\\.$', '') | list }}
+    tags: [ checks, check_dns ]
+
+  - name: Confirm forward and reverse DNS agree with the request
+    ansible.builtin.assert:
+      that:
+      - vm_ip_address in resolved_a_records
+      - vm_fqdn | lower in (resolved_ptr_records | map('lower') | list)
+      fail_msg: >-
+        DNS validation failed. Expected {{ vm_fqdn }} -> {{ vm_ip_address }} and {{ vm_ip_address }} -> {{ vm_fqdn }}. A={{ resolved_a_records }}, PTR={{ resolved_ptr_records }}.
+    tags: [ checks, check_dns ]
+
+  - name: Test whether the proposed IP responds to ICMP
+    ansible.builtin.command:
+      argv:
+      - /usr/bin/ping
+      - -c
+      - "3"
+      - -W
+      - "2"
+      - "{{ vm_ip_address }}"
+    register: vm_ip_ping
+    changed_when: false
+    failed_when: vm_ip_ping.rc not in [0, 1]
+    tags: [ checks, check_ip ]
+
+  - name: Refuse an IP address that is already responding
+    ansible.builtin.assert:
+      that:
+      - vm_ip_ping.rc != 0
+      fail_msg: >-
+        {{ vm_ip_address }} responds to ping. Confirm ownership in IPAM and do not continue until the address conflict is resolved.
+    tags: [ checks, check_ip ]
+
+  - name: Gather VMs from the target folder
+    community.vmware.vmware_vm_info:
+      hostname: "{{ vm_vcenter }}"
+      username: "{{ vcenter_username }}"
+      password: "{{ vcenter_password }}"
+      validate_certs: "{{ validate_certs }}"
+      folder: "{{ vm_folder }}"
+      vm_type: vm
+    register: target_folder_vm_info
+    delegate_to: localhost
+    become: false
+    tags: [ checks, check_vmware ]
+
+  - name: Build list of existing VM names
+    ansible.builtin.set_fact:
+      existing_vm_names: >-
+        {{ target_folder_vm_info.virtual_machines | default([])
+           | map(attribute='guest_name') | map('upper') | list }}
+    tags: [ checks, check_vmware ]
+
+  - name: Refuse to overwrite an existing VM
+    ansible.builtin.assert:
+      that:
+      - vm_name not in existing_vm_names
+      fail_msg: >-
+        VM {{ vm_name }} already exists in {{ vm_vcenter }} under {{ vm_folder }}. Automatic overwrite is prohibited.
+    tags: [ checks, check_vmware ]
+
+  - name: Confirm the source template exists
+    community.vmware.vmware_guest_info:
+      hostname: "{{ vm_vcenter }}"
+      username: "{{ vcenter_username }}"
+      password: "{{ vcenter_password }}"
+      validate_certs: "{{ validate_certs }}"
+      datacenter: "{{ vm_datacenter }}"
+      name: "{{ vm_template }}"
+    register: source_template_info
+    delegate_to: localhost
+    become: false
+    tags: [ checks, check_vmware ]
+
+  - name: Gather target datastore information
+    community.vmware.vmware_datastore_info:
+      hostname: "{{ vm_vcenter }}"
+      username: "{{ vcenter_username }}"
+      password: "{{ vcenter_password }}"
+      validate_certs: "{{ validate_certs }}"
+      datacenter_name: "{{ vm_datacenter }}"
+      name: "{{ vm_datastore }}"
+    register: target_datastore_info
+    delegate_to: localhost
+    become: false
+    tags: [ checks, check_capacity ]
+
+  - name: Confirm the target datastore was returned
+    ansible.builtin.assert:
+      that:
+      - target_datastore_info.datastores | default([]) | length == 1
+      fail_msg: >-
+        Datastore {{ vm_datastore }} was not uniquely found in {{ vm_datacenter }} on {{ vm_vcenter }}.
+    tags: [ checks, check_capacity ]
+
+  - name: Capacity-validation integration point
+    ansible.builtin.debug:
+      msg: >-
+        TODO: calculate projected datastore utilization, including the template disks and vm_additional_disks, and refuse builds projected above {{ maximum_projected_datastore_used_percent }} percent.
+    tags: [ checks, check_capacity ]
+
+  # ------------------------------------------------------------------
+  # Plan/report mode
+  # ------------------------------------------------------------------
+  - name: Show validated VM build plan
+    ansible.builtin.debug:
+      msg:
+      - "Action: {{ build_action }}"
+      - "VM: {{ vm_name }} ({{ vm_fqdn }})"
+      - "Environment: {{ build_environment }}"
+      - "Change: {{ change_control_id }}"
+      - "vCenter: {{ vm_vcenter }}"
+      - "Datacenter/cluster: {{ vm_datacenter }} / {{ vm_cluster }}"
+      - "Folder: {{ vm_folder }}"
+      - "Template: {{ vm_template }}"
+      - "Datastore: {{ vm_datastore }}"
+      - "Network: {{ vm_network }}"
+      - "IP: {{ vm_ip_address }}"
+      - "CPU/memory: {{ vm_cpus }} CPU / {{ vm_memory_mb }} MB"
+      - "Additional disks: {{ vm_additional_disks | default([]) }}"
+      - "Power on after build: {{ power_on_after_build }}"
+    tags: [ always, plan ]
+
+  - name: Stop safely after validation in plan mode
+    ansible.builtin.meta: end_host
+    when: build_action == 'plan'
+    tags: [ always, plan ]
+
+  # ------------------------------------------------------------------
+  # VM creation
+  # ------------------------------------------------------------------
+  - name: Clone and configure the VM in a powered-off state
+    community.vmware.vmware_guest:
+      hostname: "{{ vm_vcenter }}"
+      username: "{{ vcenter_username }}"
+      password: "{{ vcenter_password }}"
+      validate_certs: "{{ validate_certs }}"
+      datacenter: "{{ vm_datacenter }}"
+      cluster: "{{ vm_cluster }}"
+      folder: "{{ vm_folder }}"
+      name: "{{ vm_name }}"
+      template: "{{ vm_template }}"
+      datastore: "{{ vm_datastore }}"
+      annotation: "{{ vm_annotation }}"
+      hardware:
+        num_cpus: "{{ vm_cpus }}"
+        memory_mb: "{{ vm_memory_mb }}"
+      disk: "{{ vm_additional_disks | default(omit) }}"
+      networks:
+      - name: "{{ vm_network }}"
+        connected: true
+        start_connected: true
+        type: static
+        ip: "{{ vm_ip_address }}"
+        netmask: "{{ vm_netmask }}"
+        gateway: "{{ vm_gateway }}"
+        dns_servers: "{{ vm_dns_servers }}"
+      customization:
+        hostname: "{{ vm_name | lower }}"
+        domain: "{{ vm_domain }}"
+      state: poweredoff
+    register: vm_create_result
+    delegate_to: localhost
+    become: false
+    no_log: true
+    tags: [ build ]
+
+  - name: Verify the newly created VM exists
+    community.vmware.vmware_guest_info:
+      hostname: "{{ vm_vcenter }}"
+      username: "{{ vcenter_username }}"
+      password: "{{ vcenter_password }}"
+      validate_certs: "{{ validate_certs }}"
+      datacenter: "{{ vm_datacenter }}"
+      folder: "{{ vm_folder }}"
+      name: "{{ vm_name }}"
+    register: created_vm_info
+    delegate_to: localhost
+    become: false
+    tags: [ build, verify ]
+
+  - name: Optionally power on the completed VM
+    community.vmware.vmware_guest_powerstate:
+      hostname: "{{ vm_vcenter }}"
+      username: "{{ vcenter_username }}"
+      password: "{{ vcenter_password }}"
+      validate_certs: "{{ validate_certs }}"
+      datacenter: "{{ vm_datacenter }}"
+      folder: "{{ vm_folder }}"
+      name: "{{ vm_name }}"
+      state: powered-on
+    when: power_on_after_build | bool
+    delegate_to: localhost
+    become: false
+    tags: [ power_on ]
+
+  - name: Optionally wait for SSH after power on
+    ansible.builtin.wait_for:
+      host: "{{ vm_ip_address }}"
+      port: 22
+      state: started
+      delay: 15
+      timeout: "{{ ssh_wait_timeout }}"
+    when:
+    - power_on_after_build | bool
+    - wait_for_ssh_after_power_on | bool
+    delegate_to: localhost
+    become: false
+    tags: [ power_on, verify ]
+
+  # ------------------------------------------------------------------
+  # Future commissioning stages
+  # ------------------------------------------------------------------
+  - name: Show future operating-system commissioning stages
+    ansible.builtin.debug:
+      msg:
+      - "TODO: verify hostname, IP, routes, DNS, and NTP."
+      - "TODO: configure LVM, filesystems, and mounts."
+      - "TODO: join Centrify/AD and assign computer roles."
+      - "TODO: register Red Hat Satellite and repositories."
+      - "TODO: install/verify Splunk, CrowdStrike, Tenable, SCOM/OMI, Chef, and Rubrik."
+      - "TODO: run final health checks and send the commissioning email."
+    tags: [ post_build ]
+
+  - name: Report VM build completion
+    ansible.builtin.debug:
+      msg: >-
+        VM {{ vm_name }} was created successfully in a powered-off state. Power-on requested={{ power_on_after_build }}. Review the post-build commissioning TODO stages before production use.
+    tags: [ always ]
