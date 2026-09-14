@@ -44,22 +44,6 @@
     wait_for_ssh_after_power_on: true
     ssh_wait_timeout: 900
 
-    # VMware Python environment already used by the decommission workflow.
-    ansible_python_interpreter: /home/fr24862a/.venvs/ansible-vmware/bin/python
-
-    # Capacity policy placeholder. Enforce this after confirming the exact
-    # vmware_datastore_info return structure in the installed collection.
-    maximum_projected_datastore_used_percent: 80
-
-    # Standardized names derived from inventory data.
-    vm_name: "{{ inventory_hostname.split('.')[0] | upper }}"
-    vm_annotation: |
-      Status: VM commissioned through Ansible.
-      Change: {{ change_control_id }}
-      Environment: {{ build_environment }}
-      Template: {{ vm_template }}
-      Build date: {{ lookup('pipe', 'date +%m-%d-%Y') }}
-
   pre_tasks:
   - name: Validate workflow safety controls
     ansible.builtin.assert:

@@ -111,6 +111,8 @@ Available tag groups include `checks`, `check_dns`, `check_ip`, `check_vmware`, 
 
 ```text
 inventory/                       # Local inventory files
+inventory/group_vars/all.yml     # Shared workflow and derived variables
+inventory/host_vars/              # Per-VM commissioning variables
 playbooks/01_vm_build_skeleton.yml
 roles/                           # Reserved for future commissioning roles
 var/                             # Reserved for workflow variables

@@ -1,0 +1,17 @@
+# Shared commissioning variables.
+# Put VM-specific values in inventory/host_vars/<inventory_hostname>.yml.
+
+# VMware Python environment used by the controller.
+ansible_python_interpreter: /home/fr24862a/.venvs/ansible-vmware/bin/python
+
+# Capacity policy.
+maximum_projected_datastore_used_percent: 80
+
+# Standardized VM name and vCenter annotation.
+vm_name: "{{ inventory_hostname.split('.')[0] | upper }}"
+vm_annotation: |
+  Status: VM commissioned through Ansible.
+  Change: {{ change_control_id }}
+  Environment: {{ build_environment }}
+  Template: {{ vm_template }}
+  Build date: {{ lookup('pipe', 'date +%m-%d-%Y') }}
